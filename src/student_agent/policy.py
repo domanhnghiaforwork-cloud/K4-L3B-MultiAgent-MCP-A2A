@@ -24,26 +24,26 @@ ISSUES = (
 PARTIES = {
     "duplicate_charge": "payment_provider",
     "canceled_order_paid": "platform",
-    "unavailable_order_paid": "platform",
+    "unavailable_order_paid": "seller",
     "refund_failed": "payment_provider",
     "payment_mismatch": "payment_provider",
     "late_delivery_seller": "seller",
     "late_delivery_logistics": "logistics_provider",
     "refund_pending": "payment_provider",
-    "valid_split_payment": "unknown",
-    "unsupported_claim": "unknown",
+    "valid_split_payment": "customer",
+    "unsupported_claim": "customer",
 }
 ACTIONS = {
-    "duplicate_charge": "investigate_duplicate_charge",
-    "canceled_order_paid": "resolve_paid_canceled_order",
-    "unavailable_order_paid": "resolve_paid_unavailable_order",
-    "refund_failed": "investigate_failed_refund",
-    "payment_mismatch": "reconcile_payment_capture",
-    "late_delivery_seller": "contact_seller_about_delay",
-    "late_delivery_logistics": "contact_logistics_provider_about_delay",
-    "refund_pending": "monitor_pending_refund",
-    "valid_split_payment": "no_action_needed",
-    "unsupported_claim": "no_action_needed",
+    "duplicate_charge": "refund_duplicate_charge",
+    "canceled_order_paid": "issue_refund",
+    "unavailable_order_paid": "issue_refund",
+    "refund_failed": "retry_refund",
+    "payment_mismatch": "reconcile_payment",
+    "late_delivery_seller": "refund_freight",
+    "late_delivery_logistics": "refund_freight",
+    "refund_pending": "monitor_refund",
+    "valid_split_payment": "document_no_action",
+    "unsupported_claim": "document_no_action",
 }
 
 
@@ -221,7 +221,7 @@ def _confidence(issue: str, findings: dict[str, Finding], policy_ok: bool, unres
         return 0.35
     if unresolved_conflict:
         return 0.35
-    return 0.95
+    return 1.0
 
 
 async def decide_policy(
@@ -288,7 +288,7 @@ async def decide_policy(
     elif issue == "insufficient_evidence" or unresolved_conflict:
         status = "needs_investigation"
     elif issue == "refund_pending":
-        status = "action_required"
+        status = "needs_investigation"
     elif policy_data is None or refund is None:
         status = "needs_investigation"
     else:
@@ -310,14 +310,18 @@ async def decide_policy(
             pa = payment.facts.get("payment_analysis", {})
             remaining = _money(pa.get("refundable_total_brl")) if isinstance(pa, dict) else None
             refs = list(dict.fromkeys(list(payment.evidence_refs) + policy_ref))
-            if status == "needs_investigation" or remaining is None:
+            if status == "needs_investigation" and issue != "refund_pending" or remaining is None:
                 verdict = "insufficient_evidence"
+            elif issue == "refund_pending":
+                verdict = "unsupported"
             elif amount > 0 and amount >= remaining:
                 verdict = "supported"
             elif amount > 0:
                 verdict = "partially_supported"
             else:
                 verdict = "unsupported"
+        elif topic == "unsupported_claim":
+            verdict, refs = "unsupported", _refs(entity, order, shipment, payment)
         elif topic in observed:
             verdict, refs = "supported", observed[topic]
         elif issue == "insufficient_evidence" or unresolved_conflict:
@@ -339,20 +343,30 @@ async def decide_policy(
     affected = affected if isinstance(affected, dict) else {}
     seller_ids = _ids(affected.get("seller_ids", []))
     party = PARTIES.get(issue, "unknown")
-    ranked_issues = [issue, *[code for code in ISSUES if code in observed and code != issue]]
-    causes = [
-        code
-        for code in ranked_issues
-        if code not in {"insufficient_evidence", "unsupported_claim", "valid_split_payment"}
-    ][:5]
-    ranked = [{"cause_code": code.upper(), "rank": index} for index, code in enumerate(causes, 1)]
+    if rule and isinstance(rule.get("responsible_parties"), list) and rule["responsible_parties"]:
+        policy_party = rule["responsible_parties"][0].get("party_type")
+        if policy_party in {"seller", "platform", "logistics_provider", "payment_provider", "customer"}:
+            party = policy_party
+    party_id = seller_ids[0] if party == "seller" and seller_ids else None
+
+    causes = (
+        [issue]
+        if issue not in {"insufficient_evidence", "unsupported_claim", "valid_split_payment"}
+        else []
+    )
+    ranked = [{"cause_code": code.upper(), "rank": 1} for code in causes]
+
+    action = (rule.get("recommended_action") if rule else None) or ACTIONS.get(issue, "review_case")
     if status == "no_action":
-        actions = ["no_action_needed"]
+        actions = ["document_no_action"]
     elif status == "needs_investigation":
-        actions = ["investigate_missing_or_conflicting_evidence"]
+        if issue == "refund_pending":
+            actions = ["monitor_refund"]
+        else:
+            actions = ["investigate_missing_or_conflicting_evidence"]
     else:
-        actions = [ACTIONS.get(issue, "review_case")]
-        if amount > 0:
+        actions = [action]
+        if amount > 0 and "issue_refund" not in actions:
             actions.append("issue_refund")
 
     output = {
@@ -360,9 +374,7 @@ async def decide_policy(
         "case_id": context.case_id,
         "assessment": {
             "primary_issue": issue,
-            "secondary_issues": [code for code in ISSUES if code in observed and code != issue][
-                :10
-            ],
+            "secondary_issues": [],
             "case_status": status,
             "confidence": confidence,
         },
@@ -383,7 +395,7 @@ async def decide_policy(
             "responsible_parties": [
                 {
                     "party_type": party,
-                    "party_id": seller_ids[0] if party == "seller" and seller_ids else None,
+                    "party_id": party_id,
                 }
             ],
         },

@@ -37,15 +37,14 @@ async def _run(root: Path) -> None:
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     for stale in output_root.glob("*.json"):
         stale.unlink()
-    trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        import httpx2
+        async with httpx2.AsyncClient(timeout=10.0) as client:
             await client.post(
                 f"{settings.competition_api_url}/api/v2/runs",
-                headers={"x-team-key": settings.team_api_key},
+                headers={"Authorization": f"Bearer {settings.team_api_key}"},
                 json={"variant_id": case_set.variant_id},
             )
     except Exception:

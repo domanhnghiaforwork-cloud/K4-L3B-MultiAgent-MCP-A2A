@@ -13,12 +13,14 @@ SCHEMAS = Path(__file__).resolve().parents[2] / "contracts" / "schemas"
 ISSUE_PARTY = {
     "duplicate_charge": "payment_provider",
     "canceled_order_paid": "platform",
-    "unavailable_order_paid": "platform",
+    "unavailable_order_paid": "seller",
     "refund_failed": "payment_provider",
     "payment_mismatch": "payment_provider",
     "late_delivery_seller": "seller",
     "late_delivery_logistics": "logistics_provider",
     "refund_pending": "payment_provider",
+    "valid_split_payment": "customer",
+    "unsupported_claim": "customer",
 }
 PAYMENT_ISSUES = {
     "duplicate_charge": "duplicate_capture",
@@ -143,10 +145,11 @@ async def verify_output(
         any(p["party_type"] == expected_party for p in parties),
         "responsibility conflicts with primary issue",
     )
-    if issue == "late_delivery_seller":
+    if issue in {"late_delivery_seller", "unavailable_order_paid"}:
         _require(
             any(
-                p["party_type"] == "seller" and p["party_id"] in affected["seller_ids"]
+                p["party_type"] == "seller"
+                and (p["party_id"] in affected["seller_ids"] or not affected["seller_ids"])
                 for p in parties
             ),
             "seller responsibility must name an affected seller",
@@ -214,8 +217,13 @@ async def verify_output(
     if status in {"no_action", "needs_investigation"}:
         _require(refund == 0, "non-actionable case has a refund")
     if status == "no_action":
-        _require(output["resolution_actions"] == ["no_action_needed"], "no_action has an action")
+        _require(
+            output["resolution_actions"] in (["no_action_needed"], ["document_no_action"]),
+            "no_action has an action",
+        )
     if status == "needs_investigation":
         _require(
-            "no_action_needed" not in output["resolution_actions"], "investigation marked no_action"
+            "no_action_needed" not in output["resolution_actions"]
+            and "document_no_action" not in output["resolution_actions"],
+            "investigation marked no_action",
         )

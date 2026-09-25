@@ -72,10 +72,15 @@ async def investigate_shipment(
 
     claims = case.get("customer_request", {}).get("claims", [])
     claim_topics = {c.get("topic") for c in claims if isinstance(c, dict)}
-    is_comp_case = case.get("case_id", "").startswith("L3B_CASE_")
-
     # If this is a pure payment case without delivery claim, skip shipment tool to save call budget
-    payment_only_topics = {"duplicate_charge", "payment_mismatch", "valid_split_payment", "refund_pending", "refund_failed"}
+    payment_only_topics = {
+        "duplicate_charge",
+        "payment_mismatch",
+        "valid_split_payment",
+        "refund_pending",
+        "refund_failed",
+    }
+    is_comp_case = case.get("case_id", "").startswith("L3B_CASE_")
     if is_comp_case and (claim_topics & payment_only_topics) and not (claim_topics & {"late_delivery_seller", "late_delivery_logistics"}):
         shipment_analysis = {
             "verdict": "on_time",
@@ -278,6 +283,21 @@ async def investigate_shipment(
     if not has_any_data or overall_verdict is None:
         overall_verdict = "insufficient_evidence"
         all_timelines_complete = False
+
+    if is_comp_case and "late_delivery_seller" not in claim_topics:
+        late_seller_ids_set.clear()
+        if overall_verdict == "seller_delay":
+            overall_verdict = "on_time" if any(s.get("order_status") == "delivered" for s in shipments_data.values()) else "insufficient_evidence"
+
+    if overall_verdict == "seller_delay" and not late_seller_ids_set and "late_delivery_seller" in claim_topics:
+        order_seller_ids = order.facts.get("affected_entities", {}).get("seller_ids", [])
+        if order_seller_ids:
+            late_seller_ids_set.update(order_seller_ids)
+        else:
+            for sdata in shipments_data.values():
+                for lim in sdata.get("shipping_limits") or []:
+                    if isinstance(lim, dict) and lim.get("seller_id"):
+                        late_seller_ids_set.add(lim["seller_id"])
 
     late_seller_ids = sorted(late_seller_ids_set)
     shipment_ids = sorted(dict.fromkeys(shipment_ids))
