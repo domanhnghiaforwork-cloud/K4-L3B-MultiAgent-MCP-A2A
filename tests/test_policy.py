@@ -261,6 +261,8 @@ def test_policy_integrates_with_pulled_specialists() -> None:
 
         async def call(self, tool_name: str, *, case_id: str, **arguments: Any) -> dict[str, Any]:
             assert case_id == "CASE_POLICY_001"
+            if tool_name == "get_product_context":
+                assert arguments == {"order_id": "ORDER_1"}
             self.calls.append(tool_name)
             data = {
                 "get_customer_history": {"orders": [{"order_id": "ORDER_1"}]},
@@ -275,7 +277,12 @@ def test_policy_integrates_with_pulled_specialists() -> None:
                     ]
                 },
                 "get_sellers": {"sellers": [{"seller_id": "SELLER_1"}]},
-                "get_shipment_summary": {"order_status": "canceled", "events": []},
+                "get_product_context": {"products": [{"product_id": "PRODUCT_1"}]},
+                "get_shipment_summary": {
+                    "shipment_id": "SHIPMENT_1",
+                    "order_status": "canceled",
+                    "events": [],
+                },
                 "get_order_payments": {
                     "payments": [
                         {
@@ -302,6 +309,7 @@ def test_policy_integrates_with_pulled_specialists() -> None:
                 "get_order": "order",
                 "get_order_items": "item",
                 "get_sellers": "seller",
+                "get_product_context": "product",
                 "get_shipment_summary": "shipment",
                 "get_order_payments": "payment",
                 "get_payment_timeline": "payment",
@@ -323,7 +331,7 @@ def test_policy_integrates_with_pulled_specialists() -> None:
             **case("canceled_order_paid"),
             "candidate_order_ids": ["ORDER_1"],
             "customer_unique_id_hint": "CUSTOMER_1",
-            "investigation_scope": {"include_product_context": False},
+            "investigation_scope": {"include_product_context": True},
         }
         entity = await investigate_entity(input_case, context)
         order = await investigate_order(input_case, context, entity)
@@ -343,8 +351,9 @@ def test_policy_integrates_with_pulled_specialists() -> None:
         assert output["financial_resolution"]["recommended_refund_brl"] == 100
         assert output["affected_entities"]["item_ids"] == ["ITEM_1"]
         assert output["affected_entities"]["payment_references"] == ["PAYMENT_1"]
+        assert output["affected_entities"]["shipment_ids"] == ["SHIPMENT_1"]
         assert gateway.calls.count("get_policy") == 1
-        assert "get_product_context" not in gateway.calls
+        assert gateway.calls.count("get_product_context") == 1
         context.require_refs(output["evidence_refs"])
 
         trace = FakeTrace()

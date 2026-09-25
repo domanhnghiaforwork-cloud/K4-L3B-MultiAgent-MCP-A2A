@@ -38,20 +38,24 @@ async def investigate_order(
             warnings.append(f"get_order failed for {order_id}: {exc}")
 
         # 2. get_order_items
-        product_ids_for_order: list[str] = []
         try:
             ev = await context.fetch(actor, "get_order_items", order_id=order_id)
             evidence_refs.append(ev.evidence_ref)
             items_data[order_id] = ev.data
-            items_list = ev.data.get("items", []) if isinstance(ev.data, dict) else (ev.data if isinstance(ev.data, list) else [])
+            items_list = (
+                ev.data.get("items", [])
+                if isinstance(ev.data, dict)
+                else (ev.data if isinstance(ev.data, list) else [])
+            )
             for item in items_list:
                 if isinstance(item, dict):
-                    item_id = str(item.get("order_item_id") or item.get("item_id") or item.get("product_id", ""))
+                    item_id = str(
+                        item.get("order_item_id")
+                        or item.get("item_id")
+                        or item.get("product_id", "")
+                    )
                     if item_id and item_id not in all_item_ids:
                         all_item_ids.append(item_id)
-                    prod_id = item.get("product_id")
-                    if prod_id and prod_id not in product_ids_for_order:
-                        product_ids_for_order.append(prod_id)
                     seller_id = item.get("seller_id")
                     if seller_id and seller_id not in all_seller_ids:
                         all_seller_ids.append(seller_id)
@@ -63,7 +67,11 @@ async def investigate_order(
             ev = await context.fetch(actor, "get_sellers", order_id=order_id)
             evidence_refs.append(ev.evidence_ref)
             sellers_data[order_id] = ev.data
-            sellers_list = ev.data.get("sellers", []) if isinstance(ev.data, dict) else (ev.data if isinstance(ev.data, list) else [])
+            sellers_list = (
+                ev.data.get("sellers", [])
+                if isinstance(ev.data, dict)
+                else (ev.data if isinstance(ev.data, list) else [])
+            )
             for s in sellers_list:
                 sid = s.get("seller_id") if isinstance(s, dict) else s
                 if sid and sid not in all_seller_ids:
@@ -72,14 +80,13 @@ async def investigate_order(
             warnings.append(f"get_sellers failed for {order_id}: {exc}")
 
         # 4. get_product_context
-        if include_product and product_ids_for_order:
-            for prod_id in product_ids_for_order:
-                try:
-                    ev = await context.fetch(actor, "get_product_context", product_id=prod_id)
-                    evidence_refs.append(ev.evidence_ref)
-                    products_data[prod_id] = ev.data
-                except Exception as exc:
-                    warnings.append(f"get_product_context failed for {prod_id}: {exc}")
+        if include_product:
+            try:
+                ev = await context.fetch(actor, "get_product_context", order_id=order_id)
+                evidence_refs.append(ev.evidence_ref)
+                products_data[order_id] = ev.data
+            except Exception as exc:
+                warnings.append(f"get_product_context failed for {order_id}: {exc}")
 
     affected_entities_part = {
         "order_ids": all_order_ids,

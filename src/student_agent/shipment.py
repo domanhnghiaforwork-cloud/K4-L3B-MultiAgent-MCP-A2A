@@ -18,6 +18,26 @@ def _parse_iso(timestamp: str | None) -> datetime | None:
         return None
 
 
+def _shipment_ids(data: dict[str, Any]) -> list[str]:
+    """Return only shipment identifiers explicitly supplied by MCP evidence."""
+    result: list[str] = []
+    direct = data.get("shipment_id")
+    if isinstance(direct, str) and direct:
+        result.append(direct)
+
+    raw_ids = data.get("shipment_ids")
+    if isinstance(raw_ids, list):
+        result.extend(value for value in raw_ids if isinstance(value, str) and value)
+
+    shipments = data.get("shipments")
+    if isinstance(shipments, list):
+        for shipment in shipments:
+            value = shipment.get("shipment_id") if isinstance(shipment, dict) else shipment
+            if isinstance(value, str) and value:
+                result.append(value)
+    return list(dict.fromkeys(result))
+
+
 async def investigate_shipment(
     case: dict[str, Any], context: CaseContext, entity: Finding, order: Finding
 ) -> Finding:
@@ -61,11 +81,6 @@ async def investigate_shipment(
     overall_verdict: str | None = None
 
     for order_id in resolved_order_ids:
-        # Chuẩn hóa shipment identifier cho affected_entities
-        shipment_id_candidate = f"shipment-{order_id[:12]}"
-        if shipment_id_candidate not in shipment_ids:
-            shipment_ids.append(shipment_id_candidate)
-
         try:
             ev = await context.fetch(actor, "get_shipment_summary", order_id=order_id)
             evidence_refs.append(ev.evidence_ref)
@@ -79,6 +94,7 @@ async def investigate_shipment(
             warnings.append(f"Empty shipment summary data for order {order_id}")
             continue
 
+        shipment_ids.extend(_shipment_ids(shipment_data))
         has_any_data = True
 
         # Trích xuất dữ liệu timeline và sự kiện
@@ -119,7 +135,7 @@ async def investigate_shipment(
                     if sid:
                         valid_limits.append((sid, limit_dt))
 
-        # Kiểm tra xung đột shipping limits bất thường (ví dụ: ngày limit trước khi mua hàng hoặc cách nhau > 30 ngày)
+        # Kiểm tra limit trước ngày mua hoặc các limit cách nhau quá 30 ngày.
         if len(limit_dates) >= 2:
             max_limit = max(limit_dates)
             min_limit = min(limit_dates)
@@ -176,7 +192,7 @@ async def investigate_shipment(
                 "reason": "delivered_carrier_at_after_customer_delivery",
             })
 
-        # Xung đột 2: Khách nhận hàng đúng hạn (<= estimated) nhưng tracking event khẳng định giao trễ
+        # Khách nhận đúng hạn nhưng tracking event lại khẳng định giao trễ.
         delivered_on_time_ts = (
             customer_dt is not None
             and estimated_dt is not None
@@ -193,7 +209,7 @@ async def investigate_shipment(
                 "reason": "delivered_on_time_but_event_asserts_late",
             })
 
-        # Xung đột 3: Đơn hàng đã giao thành công (delivered) nhưng event ghi nhận thất lạc/hoàn trả
+        # Đơn đã giao thành công nhưng event lại ghi nhận thất lạc hoặc hoàn trả.
         if is_order_delivered and customer_dt and (has_lost_event or has_returned_event):
             order_conflicts.append({
                 "order_id": order_id,
@@ -224,7 +240,7 @@ async def investigate_shipment(
         else:
             order_verdict = "insufficient_evidence"
 
-        # Tổng hợp verdict tổng thể (ưu tiên trạng thái nghiêm trọng hơn: conflicting > lost > returned > seller/logistics delay > on_time)
+        # Chọn verdict nghiêm trọng nhất trong các order đã phân tích.
         verdict_precedence = {
             "conflicting": 7,
             "lost": 6,

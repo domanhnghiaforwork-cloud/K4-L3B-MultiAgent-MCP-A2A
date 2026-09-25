@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-import pytest
-from jsonschema import Draft202012Validator
 
 from student_agent.contracts import Contracts
 from student_agent.interfaces import CaseContext, Finding
@@ -103,6 +101,7 @@ def test_shipment_on_time(tmp_path: Any) -> None:
     mcp_data = {
         order_id: {
             "order_id": order_id,
+            "shipment_id": "shipment-from-mcp",
             "order_status": "delivered",
             "delivered_carrier_at": "2018-05-13T09:00:00-03:00",
             "delivered_customer_at": "2018-05-20T09:00:00-03:00",
@@ -127,6 +126,7 @@ def test_shipment_on_time(tmp_path: Any) -> None:
     assert analysis["late_seller_ids"] == []
     assert analysis["timeline_complete"] is True
     assert len(finding.evidence_refs) == 1
+    assert finding.facts["shipment_ids"] == ["shipment-from-mcp"]
 
 
 def test_shipment_seller_delay() -> None:
