@@ -2,13 +2,269 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from .interfaces import CaseContext, Finding
 
 
+def _parse_iso(timestamp: str | None) -> datetime | None:
+    """Parse an ISO 8601 timestamp string into a timezone-aware datetime."""
+    if not timestamp or not isinstance(timestamp, str):
+        return None
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
 async def investigate_shipment(
     case: dict[str, Any], context: CaseContext, entity: Finding, order: Finding
 ) -> Finding:
-    """Return shipment_analysis and shipment IDs, with supporting refs."""
-    raise NotImplementedError("Người 3 triển khai shipment investigation")
+    """Return shipment_analysis and shipment IDs, with supporting evidence refs."""
+    evidence_refs: list[str] = []
+    warnings: list[str] = []
+    actor = "shipment-agent"
+
+    # 1. Trích xuất resolved order IDs từ kết quả của entity và order
+    resolved_order_ids: list[str] = (
+        entity.facts.get("resolved_order_ids")
+        or order.facts.get("affected_entities", {}).get("order_ids")
+        or []
+    )
+
+    if not resolved_order_ids:
+        shipment_analysis = {
+            "verdict": "insufficient_evidence",
+            "late_seller_ids": [],
+            "timeline_complete": False,
+        }
+        return Finding(
+            facts={
+                "shipment_analysis": shipment_analysis,
+                "shipment_ids": [],
+                "shipments_data": {},
+                "conflicts": [],
+            },
+            evidence_refs=(),
+            warnings=("No resolved order IDs provided for shipment investigation",),
+        )
+
+    orders_data: dict[str, Any] = order.facts.get("orders_data", {})
+    shipments_data: dict[str, Any] = {}
+    shipment_ids: list[str] = []
+    late_seller_ids_set: set[str] = set()
+    conflicts: list[dict[str, Any]] = []
+
+    has_any_data = False
+    all_timelines_complete = True
+    overall_verdict: str | None = None
+
+    for order_id in resolved_order_ids:
+        # Chuẩn hóa shipment identifier cho affected_entities
+        shipment_id_candidate = f"shipment-{order_id[:12]}"
+        if shipment_id_candidate not in shipment_ids:
+            shipment_ids.append(shipment_id_candidate)
+
+        try:
+            ev = await context.fetch(actor, "get_shipment_summary", order_id=order_id)
+            evidence_refs.append(ev.evidence_ref)
+            shipment_data = ev.data if isinstance(ev.data, dict) else {}
+            shipments_data[order_id] = shipment_data
+        except Exception as exc:
+            warnings.append(f"get_shipment_summary failed for order {order_id}: {exc}")
+            continue
+
+        if not shipment_data:
+            warnings.append(f"Empty shipment summary data for order {order_id}")
+            continue
+
+        has_any_data = True
+
+        # Trích xuất dữ liệu timeline và sự kiện
+        order_status = str(shipment_data.get("order_status") or "").lower()
+        carrier_dt = _parse_iso(shipment_data.get("delivered_carrier_at"))
+        customer_dt = _parse_iso(shipment_data.get("delivered_customer_at"))
+        estimated_dt = _parse_iso(shipment_data.get("estimated_delivery_at"))
+
+        order_row = orders_data.get(order_id, {})
+        purchase_dt = _parse_iso(order_row.get("order_purchase_timestamp"))
+
+        shipping_limits = shipment_data.get("shipping_limits") or []
+        events = shipment_data.get("events") or []
+
+        # 2. Kiểm tra tính đầy đủ của timeline (timeline_complete)
+        is_order_delivered = (order_status == "delivered")
+        timeline_complete_order = (
+            carrier_dt is not None
+            and customer_dt is not None
+            and estimated_dt is not None
+            and len(shipping_limits) > 0
+            and is_order_delivered
+        )
+        if not timeline_complete_order:
+            all_timelines_complete = False
+
+        # 3. Phân tích seller delay từ shipping_limits
+        seller_late_for_order = False
+        valid_limits: list[tuple[str, datetime]] = []
+        limit_dates: list[datetime] = []
+
+        for lim in shipping_limits:
+            if isinstance(lim, dict):
+                sid = lim.get("seller_id")
+                limit_dt = _parse_iso(lim.get("shipping_limit_at"))
+                if limit_dt:
+                    limit_dates.append(limit_dt)
+                    if sid:
+                        valid_limits.append((sid, limit_dt))
+
+        # Kiểm tra xung đột shipping limits bất thường (ví dụ: ngày limit trước khi mua hàng hoặc cách nhau > 30 ngày)
+        if len(limit_dates) >= 2:
+            max_limit = max(limit_dates)
+            min_limit = min(limit_dates)
+            if (max_limit - min_limit).days > 30:
+                conflicts.append({
+                    "order_id": order_id,
+                    "field": "shipping_limit_at",
+                    "sources": [min_limit.isoformat(), max_limit.isoformat()],
+                    "reason": "discrepancy_in_shipping_limits_exceeds_30_days",
+                })
+
+        for sid, limit_dt in valid_limits:
+            # Nếu có purchase_dt, bỏ qua limit xuất hiện trước purchase_dt (limit lỗi/giả mạo)
+            if purchase_dt and limit_dt < purchase_dt:
+                conflicts.append({
+                    "order_id": order_id,
+                    "field": "shipping_limit_at",
+                    "sources": [limit_dt.isoformat(), purchase_dt.isoformat()],
+                    "reason": "shipping_limit_prior_to_purchase_date",
+                })
+                continue
+
+            if carrier_dt and carrier_dt > limit_dt:
+                late_seller_ids_set.add(sid)
+                seller_late_for_order = True
+
+        # 4. Kiểm tra sự kiện theo dõi (events)
+        has_late_event = False
+        late_event_actor: str | None = None
+        has_lost_event = False
+        has_returned_event = False
+
+        for evt in events:
+            if isinstance(evt, dict):
+                evt_type = evt.get("event_type")
+                evt_status = evt.get("status")
+                if evt_type == "delivered_late" and evt_status in ("confirmed", None):
+                    has_late_event = True
+                    late_event_actor = evt.get("actor")
+                elif evt_type in ("lost", "package_lost"):
+                    has_lost_event = True
+                elif evt_type in ("returned", "returned_to_sender"):
+                    has_returned_event = True
+
+        # 5. Kiểm tra các xung đột dữ liệu (conflicting)
+        order_conflicts: list[dict[str, Any]] = []
+
+        # Xung đột 1: Giao cho bưu tá sau ngày khách đã nhận
+        if carrier_dt and customer_dt and carrier_dt > customer_dt:
+            order_conflicts.append({
+                "order_id": order_id,
+                "field": "delivered_carrier_vs_customer",
+                "sources": [carrier_dt.isoformat(), customer_dt.isoformat()],
+                "reason": "delivered_carrier_at_after_customer_delivery",
+            })
+
+        # Xung đột 2: Khách nhận hàng đúng hạn (<= estimated) nhưng tracking event khẳng định giao trễ
+        delivered_on_time_ts = (
+            customer_dt is not None
+            and estimated_dt is not None
+            and customer_dt <= estimated_dt
+        )
+        if delivered_on_time_ts and has_late_event:
+            order_conflicts.append({
+                "order_id": order_id,
+                "field": "delivered_customer_at_vs_events",
+                "sources": [
+                    customer_dt.isoformat() if customer_dt else None,
+                    estimated_dt.isoformat() if estimated_dt else None,
+                ],
+                "reason": "delivered_on_time_but_event_asserts_late",
+            })
+
+        # Xung đột 3: Đơn hàng đã giao thành công (delivered) nhưng event ghi nhận thất lạc/hoàn trả
+        if is_order_delivered and customer_dt and (has_lost_event or has_returned_event):
+            order_conflicts.append({
+                "order_id": order_id,
+                "field": "order_status_vs_event",
+                "sources": [order_status, "lost_or_returned_event"],
+                "reason": "delivered_order_has_lost_or_returned_event",
+            })
+
+        conflicts.extend(order_conflicts)
+
+        # 6. Xác định verdict cho order này theo thứ tự ưu tiên
+        order_verdict: str
+        if order_conflicts:
+            order_verdict = "conflicting"
+        elif order_status in ("lost", "package_lost") or has_lost_event:
+            order_verdict = "lost"
+        elif order_status in ("returned", "returned_to_sender") or has_returned_event:
+            order_verdict = "returned"
+        elif seller_late_for_order or (has_late_event and late_event_actor == "seller"):
+            order_verdict = "seller_delay"
+        elif (
+            (customer_dt is not None and estimated_dt is not None and customer_dt > estimated_dt)
+            or (has_late_event and late_event_actor == "logistics_provider")
+        ):
+            order_verdict = "logistics_delay"
+        elif is_order_delivered and delivered_on_time_ts:
+            order_verdict = "on_time"
+        else:
+            order_verdict = "insufficient_evidence"
+
+        # Tổng hợp verdict tổng thể (ưu tiên trạng thái nghiêm trọng hơn: conflicting > lost > returned > seller/logistics delay > on_time)
+        verdict_precedence = {
+            "conflicting": 7,
+            "lost": 6,
+            "returned": 5,
+            "seller_delay": 4,
+            "logistics_delay": 3,
+            "insufficient_evidence": 2,
+            "on_time": 1,
+        }
+
+        if overall_verdict is None:
+            overall_verdict = order_verdict
+        else:
+            current_score = verdict_precedence.get(overall_verdict, 0)
+            order_score = verdict_precedence.get(order_verdict, 0)
+            if order_score > current_score:
+                overall_verdict = order_verdict
+
+    if not has_any_data or overall_verdict is None:
+        overall_verdict = "insufficient_evidence"
+        all_timelines_complete = False
+
+    late_seller_ids = sorted(late_seller_ids_set)
+    shipment_ids = sorted(dict.fromkeys(shipment_ids))
+
+    shipment_analysis = {
+        "verdict": overall_verdict,
+        "late_seller_ids": late_seller_ids,
+        "timeline_complete": all_timelines_complete,
+    }
+
+    facts = {
+        "shipment_analysis": shipment_analysis,
+        "shipment_ids": shipment_ids,
+        "shipments_data": shipments_data,
+        "conflicts": conflicts,
+    }
+
+    return Finding(
+        facts=facts,
+        evidence_refs=tuple(dict.fromkeys(evidence_refs)),
+        warnings=tuple(warnings),
+    )
