@@ -129,6 +129,7 @@ def _issue(case: dict[str, Any], observed: dict[str, list[str]]) -> str:
 
 
 def _refund_rule(policy_data: Any, issue: str) -> dict[str, Any] | None:
+    """Accept explicit MCP refund_rules/rules entries keyed by issue code."""
     if not isinstance(policy_data, dict):
         return None
     rules = policy_data.get("refund_rules") or policy_data.get("rules")

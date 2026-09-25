@@ -44,20 +44,22 @@ def _append(
     sources: tuple[str, str],
     selected: str | None,
     code: str,
-) -> None:
-    if not field or sources[0] == sources[1]:
-        return
+) -> bool:
+    if not field or sources[0] == sources[1] or len(rows) >= 5:
+        return False
     candidate = {
         "field": field[:100],
         "sources": list(sources),
         "selected_source": selected,
         "resolution_code": code,
     }
-    if not any(
+    if any(
         row["field"] == candidate["field"] and row["sources"] == candidate["sources"]
         for row in rows
     ):
-        rows.append(candidate)
+        return False
+    rows.append(candidate)
+    return True
 
 
 async def resolve_conflicts(
@@ -85,14 +87,15 @@ async def resolve_conflicts(
         and claimed not in resolved
         and entity.evidence_refs
     ):
-        _append(
+        added = _append(
             rows,
             field="claimed_order_id",
             sources=("customer_request", "mcp_order"),
             selected="mcp_order",
             code="claim_candidate_rejected",
         )
-        refs.extend(entity.evidence_refs)
+        if added:
+            refs.extend(entity.evidence_refs)
 
     # The order row is the authoritative source for the order's status.
     order_rows = order.facts.get("orders_data", {})
@@ -102,15 +105,16 @@ async def resolve_conflicts(
             order_status = _status(order_rows.get(order_id))
             shipment_status = _status(shipment_rows.get(order_id))
             if order_status and shipment_status and order_status != shipment_status:
-                _append(
+                added = _append(
                     rows,
                     field=f"{order_id}.order_status",
                     sources=("get_order", "get_shipment_summary"),
                     selected="get_order" if order.evidence_refs else None,
                     code="authoritative_order_status",
                 )
-                refs.extend(order.evidence_refs)
-                refs.extend(shipment.evidence_refs)
+                if added:
+                    refs.extend(order.evidence_refs)
+                    refs.extend(shipment.evidence_refs)
 
     # Contradictions within a shipment response remain unresolved unless an
     # independent order timestamp invalidates a pre-purchase shipping limit.
@@ -131,20 +135,19 @@ async def resolve_conflicts(
             selected = None
             if reason == "shipping_limit_prior_to_purchase_date" and order.evidence_refs:
                 selected = sources[0]
-                refs.extend(order.evidence_refs)
-            _append(
+            added = _append(
                 rows,
                 field=field,
                 sources=sources,
                 selected=selected,
                 code=reason,
             )
-            refs.extend(shipment.evidence_refs)
+            if added:
+                if selected is not None:
+                    refs.extend(order.evidence_refs)
+                refs.extend(shipment.evidence_refs)
 
     # Keep the public schema's five-conflict limit and reference only emitted facts.
-    rows = rows[:5]
-    if not rows:
-        refs = []
     selected_sources = {
         row["field"]: row["selected_source"] for row in rows if row["selected_source"] is not None
     }
