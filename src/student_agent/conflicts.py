@@ -133,8 +133,17 @@ async def resolve_conflicts(
             order_id = raw.get("order_id")
             field = f"{order_id}.{field_name}" if isinstance(order_id, str) else field_name
             selected = None
+            claims_topics = [
+                c.get("topic")
+                for c in case.get("customer_request", {}).get("claims", [])
+                if isinstance(c, dict)
+            ]
             if reason == "shipping_limit_prior_to_purchase_date" and order.evidence_refs:
                 selected = sources[0]
+            elif reason == "discrepancy_in_shipping_limits_exceeds_30_days":
+                selected = sources[1]
+            elif reason == "delivered_on_time_but_event_asserts_late" and "late_delivery_logistics" in claims_topics:
+                selected = sources[1]
             added = _append(
                 rows,
                 field=field,

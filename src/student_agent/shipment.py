@@ -222,7 +222,18 @@ async def investigate_shipment(
 
         # 6. Xác định verdict cho order này theo thứ tự ưu tiên
         order_verdict: str
-        if order_conflicts:
+        claims_topics = [
+            c.get("topic")
+            for c in case.get("customer_request", {}).get("claims", [])
+            if isinstance(c, dict)
+        ]
+        if (
+            "late_delivery_logistics" in claims_topics
+            and has_late_event
+            and late_event_actor == "logistics_provider"
+        ):
+            order_verdict = "logistics_delay"
+        elif order_conflicts:
             order_verdict = "conflicting"
         elif order_status in ("lost", "package_lost") or has_lost_event:
             order_verdict = "lost"

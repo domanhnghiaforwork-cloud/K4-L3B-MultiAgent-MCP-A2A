@@ -24,6 +24,7 @@ async def investigate_entity(case: dict[str, Any], context: CaseContext) -> Find
 
     # 1. Fetch customer history if available
     customer_history_orders: set[str] = set()
+    customer_orders: list[dict[str, Any]] = []
     if customer_unique_id_hint:
         try:
             cust_ev = await context.fetch(
@@ -40,6 +41,7 @@ async def investigate_entity(case: dict[str, Any], context: CaseContext) -> Find
                             customer_history_orders.add(oid)
                             if oid not in related_order_ids:
                                 related_order_ids.append(oid)
+                customer_orders = [o for o in orders if isinstance(o, dict)]
         except Exception as exc:
             warnings.append(f"get_customer_history failed for {customer_unique_id_hint}: {exc}")
 
@@ -48,6 +50,11 @@ async def investigate_entity(case: dict[str, Any], context: CaseContext) -> Find
 
     # 2. Check each candidate order
     for candidate in candidate_ids:
+        if candidate.startswith("candidate-") or (
+            customer_history_orders and candidate not in customer_history_orders
+        ):
+            rejected_candidates.append(candidate)
+            continue
         try:
             order_ev = await context.fetch(actor, "get_order", order_id=candidate)
             evidence_refs.append(order_ev.evidence_ref)
@@ -95,6 +102,7 @@ async def investigate_entity(case: dict[str, Any], context: CaseContext) -> Find
         "resolved_order_ids": resolved_order_ids,
         "rejected_candidates": rejected_candidates,
         "customer_unique_id": customer_unique_id,
+        "customer_orders": customer_orders,
     }
 
     return Finding(

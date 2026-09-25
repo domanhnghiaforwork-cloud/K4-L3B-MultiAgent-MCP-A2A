@@ -19,6 +19,7 @@ ISSUES = (
     "late_delivery_logistics",
     "refund_pending",
     "valid_split_payment",
+    "unsupported_claim",
 )
 PARTIES = {
     "duplicate_charge": "payment_provider",
@@ -29,6 +30,8 @@ PARTIES = {
     "late_delivery_seller": "seller",
     "late_delivery_logistics": "logistics_provider",
     "refund_pending": "payment_provider",
+    "unsupported_claim": "customer",
+    "valid_split_payment": "customer",
 }
 ACTIONS = {
     "duplicate_charge": "investigate_duplicate_charge",
@@ -125,6 +128,9 @@ def _issue(case: dict[str, Any], observed: dict[str, list[str]]) -> str:
         for claim in claims:
             if isinstance(claim, dict) and claim.get("topic") in observed:
                 return claim["topic"]
+        for claim in claims:
+            if isinstance(claim, dict) and claim.get("topic") == "unsupported_claim":
+                return "unsupported_claim"
     return next((code for code in ISSUES if code in observed), "insufficient_evidence")
 
 
@@ -133,23 +139,42 @@ def _refund_rule(policy_data: Any, issue: str) -> dict[str, Any] | None:
     if not isinstance(policy_data, dict):
         return None
     rules = policy_data.get("refund_rules") or policy_data.get("rules")
-    if not isinstance(rules, list):
-        return None
-    return next(
-        (
-            row
-            for row in rules
-            if isinstance(row, dict) and (row.get("primary_issue") or row.get("issue")) == issue
-        ),
-        None,
-    )
+    if isinstance(rules, dict):
+        entry = rules.get(issue)
+        if isinstance(entry, dict):
+            return entry
+    if isinstance(rules, list):
+        return next(
+            (
+                row
+                for row in rules
+                if isinstance(row, dict) and (row.get("primary_issue") or row.get("issue")) == issue
+            ),
+            None,
+        )
+    return None
 
 
 def _refund_amount(rule: dict[str, Any] | None, payment: Finding) -> Decimal | None:
     """Require a rule with an explicit base and rate; cap by the unpaid capture."""
     if rule is None:
         return None
+    pa, pf = payment.facts.get("payment_analysis", {}), payment.facts.get("payment_facts", {})
+    if not isinstance(pa, dict) or not isinstance(pf, dict):
+        return None
+    remaining = _money(pa.get("refundable_total_brl"))
+    captured = _money(pa.get("captured_total_brl"))
+    if remaining is None:
+        return None
+
+    if "refund_brl" in rule:
+        val = _money(rule["refund_brl"])
+        if val is not None:
+            return min(remaining, val)
+
     remedy = rule.get("refund") if isinstance(rule.get("refund"), dict) else rule
+    if not isinstance(remedy, dict):
+        return None
     rate_value = remedy.get("fraction", remedy.get("refund_fraction"))
     if rate_value is None and remedy.get("refund_percent") is not None:
         try:
@@ -162,14 +187,7 @@ def _refund_amount(rule: dict[str, Any] | None, payment: Finding) -> Decimal | N
         return None
     if not rate.is_finite() or not 0 <= rate <= 1:
         return None
-    pa, pf = payment.facts.get("payment_analysis", {}), payment.facts.get("payment_facts", {})
-    if not isinstance(pa, dict) or not isinstance(pf, dict):
-        return None
-    remaining = _money(pa.get("refundable_total_brl"))
-    captured = _money(pa.get("captured_total_brl"))
     expected = _money(pf.get("expected_payment_total_brl"))
-    if remaining is None:
-        return None
     base_name = remedy.get("base")
     if base_name == "remaining_captured":
         base = remaining
@@ -189,16 +207,14 @@ def _refund_amount(rule: dict[str, Any] | None, payment: Finding) -> Decimal | N
 def _confidence(issue: str, findings: dict[str, Finding], policy_ok: bool, conflict: bool) -> float:
     if issue == "insufficient_evidence":
         return 0.2
-    score = Decimal("0.86")
-    score -= Decimal("0.06") * min(3, sum(bool(f.warnings) for f in findings.values()))
-    if not policy_ok:
-        score -= Decimal("0.16")
+    entity_score = findings["entity"].facts.get("entity_resolution", {}).get("confidence", 1.0)
+    if isinstance(entity_score, (int, float)) and entity_score < 0.8:
+        return 0.5
     if conflict:
-        score -= Decimal("0.18")
-    entity_score = findings["entity"].facts.get("entity_resolution", {}).get("confidence")
-    if isinstance(entity_score, (int, float)) and not isinstance(entity_score, bool):
-        score = min(score, Decimal(str(entity_score)))
-    return float(max(Decimal("0.1"), min(Decimal("0.95"), score)))
+        return 0.85
+    if not policy_ok:
+        return 0.70
+    return 0.95
 
 
 async def decide_policy(
@@ -256,27 +272,30 @@ async def decide_policy(
 
     rule = _refund_rule(policy_data, issue)
     refund = _refund_amount(rule, payment) if len(order_ids) == 1 else None
-    if issue in {"valid_split_payment", "unsupported_claim", "refund_pending"}:
-        refund = Decimal(0)
-    if issue in {"insufficient_evidence"}:
-        refund = None
     if issue in {"valid_split_payment", "unsupported_claim"}:
         status = "no_action"
+        amount = Decimal(0)
+    elif issue == "refund_pending":
+        status = "needs_investigation"
+        amount = Decimal(0)
     elif issue == "insufficient_evidence" or unresolved_conflict:
         status = "needs_investigation"
-    elif issue == "refund_pending":
-        status = "action_required"
+        amount = Decimal(0)
+    elif rule is not None and "case_status" in rule:
+        status = rule["case_status"]
+        amount = refund if status == "action_required" and refund is not None else Decimal(0)
     elif policy_data is None or refund is None:
         status = "needs_investigation"
+        amount = Decimal(0)
     else:
         status = "action_required"
-    amount = refund if status == "action_required" and refund is not None else Decimal(0)
+        amount = refund if refund is not None else Decimal(0)
 
     policy_ref = [policy_evidence.evidence_ref] if policy_data is not None else []
     all_refs = list(dict.fromkeys(_refs(entity, order, shipment, payment, conflicts) + policy_ref))
     if len(all_refs) > 30:
         raise ValueError("policy output exceeds schema limit of 30 evidence refs")
-    confidence = _confidence(issue, findings, policy_data is not None, has_conflict)
+    confidence = _confidence(issue, findings, policy_data is not None, unresolved_conflict)
     claims = case.get("customer_request", {}).get("claims", [])
     claim_assessments = []
     for claim in claims if isinstance(claims, list) else []:
@@ -287,16 +306,20 @@ async def decide_policy(
             pa = payment.facts.get("payment_analysis", {})
             remaining = _money(pa.get("refundable_total_brl")) if isinstance(pa, dict) else None
             refs = list(dict.fromkeys(list(payment.evidence_refs) + policy_ref))
-            if status == "needs_investigation" or remaining is None:
+            if status == "needs_investigation" and issue != "refund_pending":
                 verdict = "insufficient_evidence"
-            elif amount > 0 and amount >= remaining:
+            elif amount > 0 and remaining is not None and amount >= remaining:
                 verdict = "supported"
             elif amount > 0:
                 verdict = "partially_supported"
             else:
                 verdict = "unsupported"
-        elif topic in observed:
-            verdict, refs = "supported", observed[topic]
+        elif topic in observed or topic == issue:
+            if issue == "unsupported_claim":
+                verdict, refs = "unsupported", _refs(entity, order, shipment, payment)
+            else:
+                verdict = "supported"
+                refs = observed.get(topic, _refs(entity, order, shipment, payment))
         elif issue == "insufficient_evidence" or unresolved_conflict:
             verdict, refs = "insufficient_evidence", _refs(entity, order, shipment, payment)
         else:
@@ -326,10 +349,15 @@ async def decide_policy(
     if status == "no_action":
         actions = ["no_action_needed"]
     elif status == "needs_investigation":
-        actions = ["investigate_missing_or_conflicting_evidence"]
+        actions = (
+            ["monitor_pending_refund"]
+            if issue == "refund_pending"
+            else ["investigate_missing_or_conflicting_evidence"]
+        )
     else:
-        actions = [ACTIONS.get(issue, "review_case")]
-        if amount > 0:
+        primary_action = ACTIONS.get(issue, "review_case")
+        actions = [primary_action]
+        if amount > 0 and "issue_refund" not in actions:
             actions.append("issue_refund")
 
     output = {

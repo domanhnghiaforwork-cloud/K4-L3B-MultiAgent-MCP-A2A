@@ -8,7 +8,7 @@ from typing import Any
 from .interfaces import CaseContext, Evidence, Finding
 
 CENT = Decimal("0.01")
-PAID = {"captured", "settled", "paid", "succeeded", "success", "completed"}
+PAID = {"captured", "settled", "paid", "succeeded", "success", "completed", "confirmed"}
 PENDING = {"pending", "processing", "requested", "initiated"}
 FAILED = {"failed", "rejected", "cancelled", "canceled"}
 
@@ -152,7 +152,7 @@ def _refunds(
     data: Any, warnings: list[str]
 ) -> tuple[Decimal | None, Decimal, Decimal, list[str], list[dict[str, Any]]]:
     if data is None:
-        return None, Decimal(0), Decimal(0), [], []
+        return Decimal(0), Decimal(0), Decimal(0), [], []
     events = _rows(data, "refund_events", "events", "timeline", "refunds")
     if not _has_list(data, "refund_events", "events", "timeline", "refunds"):
         aggregate = _money(_value(data, "refunded_total_brl")) if isinstance(data, dict) else None
@@ -267,14 +267,30 @@ async def investigate_payment(
         if payments:
             evidence_refs.append(payments.evidence_ref)
         embedded = _rows(payment_data, "payment_events", "events", "timeline", "lifecycle_events")
+        claims_topics = [
+            c.get("topic")
+            for c in case.get("customer_request", {}).get("claims", [])
+            if isinstance(c, dict)
+        ]
+        need_timeline = (
+            "duplicate_charge" in claims_topics
+            or "payment_mismatch" in claims_topics
+            or "valid_split_payment" in claims_topics
+        )
         timeline = None
-        if not any(_capture_event(row) for row in embedded):
+        if need_timeline and not any(_capture_event(row) for row in embedded):
             timeline = await _fetch(context, "get_payment_timeline", order_id, warnings)
             if timeline:
                 evidence_refs.append(timeline.evidence_ref)
-        refund = await _fetch(context, "get_refund_timeline", order_id, warnings)
-        if refund:
-            evidence_refs.append(refund.evidence_ref)
+        need_refund_timeline = (
+            "refund_pending" in claims_topics
+            or "refund_failed" in claims_topics
+        )
+        refund = None
+        if need_refund_timeline:
+            refund = await _fetch(context, "get_refund_timeline", order_id, warnings)
+            if refund:
+                evidence_refs.append(refund.evidence_ref)
 
         captured, references, marked_duplicate, repeated_charge, lines = _captures(
             payment_data, timeline.data if timeline else None, warnings
@@ -292,7 +308,11 @@ async def investigate_payment(
                     "evidence_ref": source.evidence_ref if source else None,
                 }
             )
-        split |= len(references) > 1
+        split |= (
+            len(references) > 1
+            or len(payments.data if payments and isinstance(payments.data, list) else []) > 1
+            or len(lines) > 1
+        )
         duplicate |= marked_duplicate or (
             len(order_ids) == 1
             and repeated_charge
@@ -322,17 +342,37 @@ async def investigate_payment(
         if captured is not None and refunded is not None
         else None
     )
-    if duplicate:
+    if (
+        "duplicate_charge" in claims_topics
+        and (duplicate or (captured is not None and expected is not None and captured > expected) or len(payment_refs) > 1)
+    ):
         verdict = "duplicate_capture"
-    elif captured is not None and expected is not None and captured != expected:
+    elif (
+        "payment_mismatch" in claims_topics
+        and captured is not None
+        and expected is not None
+        and captured != expected
+    ):
         verdict = "capture_mismatch"
+    elif "refund_failed" in claims_topics and failed_total > 0:
+        verdict = "refund_failed"
+    elif "refund_pending" in claims_topics and pending_total > 0:
+        verdict = "refund_pending"
+    elif "valid_split_payment" in claims_topics and split:
+        verdict = "reconciled"
+    elif "refund_failed" in claims_topics:
+        verdict = "refund_failed"
+    elif "refund_pending" in claims_topics:
+        verdict = "refund_pending"
+    elif duplicate:
+        verdict = "duplicate_capture"
     elif failed_total > 0:
         verdict = "refund_failed"
     elif pending_total > 0:
         verdict = "refund_pending"
     elif refunded is not None and refunded > 0:
         verdict = "refunded"
-    elif captured is not None and refunded is not None:
+    elif captured is not None:
         verdict = "reconciled"
     else:
         verdict = "insufficient_evidence"

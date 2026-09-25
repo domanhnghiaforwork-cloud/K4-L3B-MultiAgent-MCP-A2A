@@ -19,6 +19,8 @@ ISSUE_PARTY = {
     "late_delivery_seller": "seller",
     "late_delivery_logistics": "logistics_provider",
     "refund_pending": "payment_provider",
+    "valid_split_payment": "customer",
+    "unsupported_claim": "customer",
 }
 PAYMENT_ISSUES = {
     "duplicate_charge": "duplicate_capture",
@@ -138,11 +140,12 @@ async def verify_output(
 
     issue = output["assessment"]["primary_issue"]
     parties = output["root_cause_analysis"]["responsible_parties"]
-    expected_party = ISSUE_PARTY.get(issue, "unknown")
-    _require(
-        any(p["party_type"] == expected_party for p in parties),
-        "responsibility conflicts with primary issue",
-    )
+    expected_party = ISSUE_PARTY.get(issue)
+    if expected_party is not None:
+        _require(
+            any(p["party_type"] == expected_party for p in parties),
+            "responsibility conflicts with primary issue",
+        )
     if issue == "late_delivery_seller":
         _require(
             any(

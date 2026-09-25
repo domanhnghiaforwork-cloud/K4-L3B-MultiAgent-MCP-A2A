@@ -39,15 +39,35 @@ async def _run(root: Path) -> None:
         stale.unlink()
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"{settings.competition_api_url}/api/v2/runs",
+            headers={
+                "Authorization": f"Bearer {settings.team_api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            },
+            data=json.dumps({"variant_id": case_set.variant_id}).encode("utf-8"),
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            expires_at = data.get("expires_at")
+            print(f"Active run session confirmed: expires at {expires_at}")
+    except Exception as exc:
+        print(f"Notice: run session registration ({exc})")
 
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
+        total_cases = len(case_set.case_ids)
+        for index, case_id in enumerate(case_set.case_ids, start=1):
             case = case_set.cases[case_id]
             trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
             output = await solve_case(case, gateway, trace)
+            print(f"[{index}/{total_cases}] {case_id} -> {output['assessment']['primary_issue']}", flush=True)
             contracts.validate_output(output, f"outputs/{case_id}.json")
             if output.get("case_id") != case_id:
                 raise ValueError(f"solver returned a mismatched case_id for {case_id}")
