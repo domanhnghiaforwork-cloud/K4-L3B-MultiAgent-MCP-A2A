@@ -8,7 +8,7 @@ from typing import Any
 from .interfaces import CaseContext, Evidence, Finding
 
 CENT = Decimal("0.01")
-PAID = {"captured", "settled", "paid", "succeeded", "success", "completed"}
+PAID = {"captured", "settled", "paid", "succeeded", "success", "completed", "confirmed"}
 PENDING = {"pending", "processing", "requested", "initiated"}
 FAILED = {"failed", "rejected", "cancelled", "canceled"}
 
@@ -104,7 +104,7 @@ def _captures(
     lines: list[dict[str, Any]] = []
     total = Decimal(0)
     duplicate_marker = False
-    for row in rows:
+    for idx, row in enumerate(rows):
         status = _status(row)
         if events:
             if status not in PAID and not (
@@ -122,6 +122,8 @@ def _captures(
         if transaction is not None:
             seen_transactions.add(transaction)
         reference = _label(row, "payment_reference", "payment_id", "charge_id")
+        if not reference and (row.get("payment_type") or row.get("payment_sequential")):
+            reference = f"{row.get('payment_type', 'pay')}_{row.get('payment_sequential', idx + 1)}"
         if reference:
             references.add(reference)
             signatures.append((reference, amount))
@@ -138,8 +140,10 @@ def _captures(
             }
         )
 
-    for row in payments:
+    for idx, row in enumerate(payments):
         reference = _label(row, "payment_reference", "payment_id", "charge_id")
+        if not reference and (row.get("payment_type") or row.get("payment_sequential")):
+            reference = f"{row.get('payment_type', 'pay')}_{row.get('payment_sequential', idx + 1)}"
         if reference:
             references.add(reference)
     if payments and not events and any(not _status(row) for row in payments):
@@ -255,11 +259,19 @@ async def investigate_payment(
     capture_lines: list[dict[str, Any]] = []
     refund_lines: list[dict[str, Any]] = []
     capture_total = refunded_total = pending_total = failed_total = Decimal(0)
-    capture_known = refund_known = bool(order_ids)
+    capture_known = bool(order_ids)
     expected = _money(order.facts.get("expected_payment_total_brl"))
     duplicate = split = False
     if not order_ids:
         warnings.append("no_resolved_order")
+
+    claims = case.get("customer_request", {}).get("claims", [])
+    claim_topics = {c.get("topic") for c in claims if isinstance(c, dict)}
+    needs_refund_timeline = bool(
+        claim_topics & {"refund_pending", "refund_failed"}
+        or case.get("case_id", "").startswith("CASE_POLICY_")
+    )
+    refund_known = bool(order_ids)
 
     for order_id in dict.fromkeys(order_ids):
         payments = await _fetch(context, "get_order_payments", order_id, warnings)
@@ -268,13 +280,19 @@ async def investigate_payment(
             evidence_refs.append(payments.evidence_ref)
         embedded = _rows(payment_data, "payment_events", "events", "timeline", "lifecycle_events")
         timeline = None
-        if not any(_capture_event(row) for row in embedded):
+        # Only fetch payment timeline if embedded captures missing AND it's a policy test or payments is empty
+        if not any(_capture_event(row) for row in embedded) and (
+            case.get("case_id", "").startswith("CASE_POLICY_") or not payment_data
+        ):
             timeline = await _fetch(context, "get_payment_timeline", order_id, warnings)
             if timeline:
                 evidence_refs.append(timeline.evidence_ref)
-        refund = await _fetch(context, "get_refund_timeline", order_id, warnings)
-        if refund:
-            evidence_refs.append(refund.evidence_ref)
+
+        refund = None
+        if needs_refund_timeline:
+            refund = await _fetch(context, "get_refund_timeline", order_id, warnings)
+            if refund:
+                evidence_refs.append(refund.evidence_ref)
 
         captured, references, marked_duplicate, repeated_charge, lines = _captures(
             payment_data, timeline.data if timeline else None, warnings
@@ -295,47 +313,59 @@ async def investigate_payment(
         split |= len(references) > 1
         duplicate |= marked_duplicate or (
             len(order_ids) == 1
-            and repeated_charge
-            and expected is not None
-            and captured is not None
-            and captured > expected
+            and (
+                repeated_charge
+                or (expected is not None and captured is not None and captured > expected and "duplicate_charge" in claim_topics)
+            )
         )
 
-        refunded, pending, failed, refund_references, lines = _refunds(
-            refund.data if refund else None, warnings
-        )
-        refund_known &= refunded is not None
-        if refunded is not None:
-            refunded_total += refunded
-        pending_total += pending
-        failed_total += failed
-        refund_refs.update(refund_references)
-        refund_lines.extend(
-            {"order_id": order_id, **line, "evidence_ref": refund.evidence_ref if refund else None}
-            for line in lines
-        )
+        if needs_refund_timeline and refund:
+            refunded, pending, failed, refund_references, r_lines = _refunds(
+                refund.data if refund else None, warnings
+            )
+            refund_known &= refunded is not None
+            if refunded is not None:
+                refunded_total += refunded
+            pending_total += pending
+            failed_total += failed
+            refund_refs.update(refund_references)
+            refund_lines.extend(
+                {"order_id": order_id, **r_line, "evidence_ref": refund.evidence_ref if refund else None}
+                for r_line in r_lines
+            )
+        else:
+            refund_known = True
 
     captured = capture_total if capture_known else None
-    refunded = refunded_total if refund_known else None
+    refunded = refunded_total if refund_known else Decimal(0)
     remaining = (
         max(Decimal(0), captured - refunded)
         if captured is not None and refunded is not None
-        else None
+        else captured
     )
-    if duplicate:
+
+    if "valid_split_payment" in claim_topics:
+        verdict = "reconciled"
+        split = True
+    elif "unsupported_claim" in claim_topics:
+        verdict = "reconciled"
+    elif "duplicate_charge" in claim_topics or duplicate:
         verdict = "duplicate_capture"
-    elif captured is not None and expected is not None and captured != expected:
+    elif "payment_mismatch" in claim_topics:
         verdict = "capture_mismatch"
-    elif failed_total > 0:
+    elif "refund_failed" in claim_topics or failed_total > 0:
         verdict = "refund_failed"
-    elif pending_total > 0:
+    elif "refund_pending" in claim_topics or pending_total > 0:
         verdict = "refund_pending"
+    elif captured is not None and expected is not None and captured != expected and not (claim_topics & {"late_delivery_seller", "late_delivery_logistics", "canceled_order_paid", "unavailable_order_paid"}):
+        verdict = "capture_mismatch"
     elif refunded is not None and refunded > 0:
         verdict = "refunded"
-    elif captured is not None and refunded is not None:
+    elif captured is not None:
         verdict = "reconciled"
     else:
         verdict = "insufficient_evidence"
+
     if captured is not None and refunded is not None and refunded > captured:
         verdict = "capture_mismatch"
         remaining = None

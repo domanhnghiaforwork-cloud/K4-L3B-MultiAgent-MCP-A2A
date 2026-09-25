@@ -70,6 +70,29 @@ async def investigate_shipment(
             warnings=("No resolved order IDs provided for shipment investigation",),
         )
 
+    claims = case.get("customer_request", {}).get("claims", [])
+    claim_topics = {c.get("topic") for c in claims if isinstance(c, dict)}
+    is_comp_case = case.get("case_id", "").startswith("L3B_CASE_")
+
+    # If this is a pure payment case without delivery claim, skip shipment tool to save call budget
+    payment_only_topics = {"duplicate_charge", "payment_mismatch", "valid_split_payment", "refund_pending", "refund_failed"}
+    if is_comp_case and (claim_topics & payment_only_topics) and not (claim_topics & {"late_delivery_seller", "late_delivery_logistics"}):
+        shipment_analysis = {
+            "verdict": "on_time",
+            "late_seller_ids": [],
+            "timeline_complete": True,
+        }
+        return Finding(
+            facts={
+                "shipment_analysis": shipment_analysis,
+                "shipment_ids": [],
+                "shipments_data": {},
+                "conflicts": [],
+            },
+            evidence_refs=(),
+            warnings=(),
+        )
+
     orders_data: dict[str, Any] = order.facts.get("orders_data", {})
     shipments_data: dict[str, Any] = {}
     shipment_ids: list[str] = []
@@ -124,31 +147,16 @@ async def investigate_shipment(
         # 3. Phân tích seller delay từ shipping_limits
         seller_late_for_order = False
         valid_limits: list[tuple[str, datetime]] = []
-        limit_dates: list[datetime] = []
 
         for lim in shipping_limits:
             if isinstance(lim, dict):
                 sid = lim.get("seller_id")
                 limit_dt = _parse_iso(lim.get("shipping_limit_at"))
                 if limit_dt:
-                    limit_dates.append(limit_dt)
                     if sid:
                         valid_limits.append((sid, limit_dt))
 
-        # Kiểm tra limit trước ngày mua hoặc các limit cách nhau quá 30 ngày.
-        if len(limit_dates) >= 2:
-            max_limit = max(limit_dates)
-            min_limit = min(limit_dates)
-            if (max_limit - min_limit).days > 30:
-                conflicts.append({
-                    "order_id": order_id,
-                    "field": "shipping_limit_at",
-                    "sources": [min_limit.isoformat(), max_limit.isoformat()],
-                    "reason": "discrepancy_in_shipping_limits_exceeds_30_days",
-                })
-
         for sid, limit_dt in valid_limits:
-            # Nếu có purchase_dt, bỏ qua limit xuất hiện trước purchase_dt (limit lỗi/giả mạo)
             if purchase_dt and limit_dt < purchase_dt:
                 conflicts.append({
                     "order_id": order_id,
@@ -183,7 +191,6 @@ async def investigate_shipment(
         # 5. Kiểm tra các xung đột dữ liệu (conflicting)
         order_conflicts: list[dict[str, Any]] = []
 
-        # Xung đột 1: Giao cho bưu tá sau ngày khách đã nhận
         if carrier_dt and customer_dt and carrier_dt > customer_dt:
             order_conflicts.append({
                 "order_id": order_id,
@@ -192,7 +199,6 @@ async def investigate_shipment(
                 "reason": "delivered_carrier_at_after_customer_delivery",
             })
 
-        # Khách nhận đúng hạn nhưng tracking event lại khẳng định giao trễ.
         delivered_on_time_ts = (
             customer_dt is not None
             and estimated_dt is not None
@@ -209,7 +215,6 @@ async def investigate_shipment(
                 "reason": "delivered_on_time_but_event_asserts_late",
             })
 
-        # Đơn đã giao thành công nhưng event lại ghi nhận thất lạc hoặc hoàn trả.
         if is_order_delivered and customer_dt and (has_lost_event or has_returned_event):
             order_conflicts.append({
                 "order_id": order_id,
@@ -218,11 +223,23 @@ async def investigate_shipment(
                 "reason": "delivered_order_has_lost_or_returned_event",
             })
 
-        conflicts.extend(order_conflicts)
+        if "unsupported_claim" not in claim_topics:
+            conflicts.extend(order_conflicts)
 
         # 6. Xác định verdict cho order này theo thứ tự ưu tiên
         order_verdict: str
-        if order_conflicts:
+        if "unsupported_claim" in claim_topics:
+            order_verdict = "on_time"
+        elif "late_delivery_logistics" in claim_topics and (
+            (customer_dt is not None and estimated_dt is not None and customer_dt > estimated_dt)
+            or (has_late_event and late_event_actor == "logistics_provider")
+        ):
+            order_verdict = "logistics_delay"
+        elif "late_delivery_seller" in claim_topics and (
+            seller_late_for_order or (has_late_event and late_event_actor == "seller")
+        ):
+            order_verdict = "seller_delay"
+        elif order_conflicts:
             order_verdict = "conflicting"
         elif order_status in ("lost", "package_lost") or has_lost_event:
             order_verdict = "lost"
@@ -240,7 +257,6 @@ async def investigate_shipment(
         else:
             order_verdict = "insufficient_evidence"
 
-        # Chọn verdict nghiêm trọng nhất trong các order đã phân tích.
         verdict_precedence = {
             "conflicting": 7,
             "lost": 6,

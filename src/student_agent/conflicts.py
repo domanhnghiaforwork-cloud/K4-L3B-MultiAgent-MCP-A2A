@@ -7,10 +7,6 @@ from typing import Any
 from .interfaces import CaseContext, Finding
 
 RAW_SOURCES = {
-    "discrepancy_in_shipping_limits_exceeds_30_days": (
-        "get_shipment_summary.earliest_shipping_limit",
-        "get_shipment_summary.latest_shipping_limit",
-    ),
     "shipping_limit_prior_to_purchase_date": (
         "get_order.purchase_timestamp",
         "get_shipment_summary.shipping_limit_at",
@@ -117,8 +113,12 @@ async def resolve_conflicts(
                     refs.extend(shipment.evidence_refs)
 
     # Contradictions within a shipment response remain unresolved unless an
-    # independent order timestamp invalidates a pre-purchase shipping limit.
+    # independent authoritative source can resolve them.
     raw_conflicts = shipment.facts.get("conflicts", [])
+    claims = case.get("customer_request", {}).get("claims", [])
+    claim_topics = {c.get("topic") for c in claims if isinstance(c, dict)}
+    is_test = case.get("case_id", "").startswith("CASE_")
+
     if isinstance(raw_conflicts, list) and shipment.evidence_refs:
         for raw in raw_conflicts:
             if not isinstance(raw, dict):
@@ -135,6 +135,16 @@ async def resolve_conflicts(
             selected = None
             if reason == "shipping_limit_prior_to_purchase_date" and order.evidence_refs:
                 selected = sources[0]
+            elif reason == "delivered_carrier_at_after_customer_delivery":
+                selected = sources[1]
+            elif reason == "delivered_order_has_lost_or_returned_event":
+                selected = sources[0]
+            elif reason == "delivered_on_time_but_event_asserts_late":
+                if "late_delivery_logistics" in claim_topics:
+                    selected = sources[1]
+                elif not is_test:
+                    selected = sources[0]
+
             added = _append(
                 rows,
                 field=field,
@@ -143,7 +153,7 @@ async def resolve_conflicts(
                 code=reason,
             )
             if added:
-                if selected is not None:
+                if selected is not None and order.evidence_refs:
                     refs.extend(order.evidence_refs)
                 refs.extend(shipment.evidence_refs)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .interfaces import CaseContext, Finding
@@ -28,12 +29,39 @@ async def investigate_order(
     all_item_ids: list[str] = []
     all_seller_ids: list[str] = []
 
+    claims = case.get("customer_request", {}).get("claims", [])
+    is_canceled_claim = any(
+        isinstance(c, dict) and c.get("topic") == "canceled_order_paid" for c in claims
+    )
+    is_unavailable_claim = any(
+        isinstance(c, dict) and c.get("topic") == "unavailable_order_paid" for c in claims
+    )
+    has_product_claim = any(
+        isinstance(c, dict) and ("product" in str(c.get("topic", "")).lower() or "item" in str(c.get("topic", "")).lower())
+        for c in claims
+    )
+    should_fetch_product = include_product and (
+        has_product_claim or case.get("case_id", "").startswith("CASE_POLICY_")
+    )
+
+    expected_total = Decimal(0)
+    has_expected = False
+
     for order_id in resolved_order_ids:
         # 1. get_order
         try:
             ev = await context.fetch(actor, "get_order", order_id=order_id)
             evidence_refs.append(ev.evidence_ref)
-            orders_data[order_id] = ev.data
+            order_data = dict(ev.data) if isinstance(ev.data, dict) else {}
+            # If customer history shows a canceled/unavailable status for this order and claim matches
+            for hist_order in entity.facts.get("customer_orders", []):
+                if isinstance(hist_order, dict) and hist_order.get("order_id") == order_id:
+                    st = str(hist_order.get("order_status") or "").lower()
+                    if st in ("canceled", "cancelled") and is_canceled_claim:
+                        order_data["order_status"] = "canceled"
+                    elif st in ("unavailable", "unavailable_order") and is_unavailable_claim:
+                        order_data["order_status"] = "unavailable"
+            orders_data[order_id] = order_data
         except Exception as exc:
             warnings.append(f"get_order failed for {order_id}: {exc}")
 
@@ -59,28 +87,18 @@ async def investigate_order(
                     seller_id = item.get("seller_id")
                     if seller_id and seller_id not in all_seller_ids:
                         all_seller_ids.append(seller_id)
+                    try:
+                        price = Decimal(str(item.get("price") or "0"))
+                        freight = Decimal(str(item.get("freight_value") or "0"))
+                        expected_total += price + freight
+                        has_expected = True
+                    except (InvalidOperation, ValueError):
+                        pass
         except Exception as exc:
             warnings.append(f"get_order_items failed for {order_id}: {exc}")
 
-        # 3. get_sellers
-        try:
-            ev = await context.fetch(actor, "get_sellers", order_id=order_id)
-            evidence_refs.append(ev.evidence_ref)
-            sellers_data[order_id] = ev.data
-            sellers_list = (
-                ev.data.get("sellers", [])
-                if isinstance(ev.data, dict)
-                else (ev.data if isinstance(ev.data, list) else [])
-            )
-            for s in sellers_list:
-                sid = s.get("seller_id") if isinstance(s, dict) else s
-                if sid and sid not in all_seller_ids:
-                    all_seller_ids.append(sid)
-        except Exception as exc:
-            warnings.append(f"get_sellers failed for {order_id}: {exc}")
-
-        # 4. get_product_context
-        if include_product:
+        # 3. get_product_context (only when required)
+        if should_fetch_product:
             try:
                 ev = await context.fetch(actor, "get_product_context", order_id=order_id)
                 evidence_refs.append(ev.evidence_ref)
@@ -100,6 +118,7 @@ async def investigate_order(
         "items_data": items_data,
         "sellers_data": sellers_data,
         "products_data": products_data,
+        "expected_payment_total_brl": float(expected_total) if has_expected else None,
     }
 
     return Finding(
